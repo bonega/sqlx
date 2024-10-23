@@ -59,6 +59,7 @@ dotenvy = "0.15.5"
 either = "1.6.1"
 generic-array = { version = "0.14.4", default-features = false }
 hex = "0.4.3"
+indoc = { version = "2" }
 itoa = "1.0.1"
 log = "0.4.18"
 memchr = { version = "2.4.1", default-features = false }
