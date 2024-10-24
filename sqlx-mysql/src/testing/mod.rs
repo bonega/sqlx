@@ -1,32 +1,30 @@
+use futures_core::future::BoxFuture;
+use once_cell::sync::OnceCell;
+use sqlx_core::connection::Connection;
+use sqlx_core::query_scalar::query_scalar;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::time::Duration;
-
-use futures_core::future::BoxFuture;
-
-use once_cell::sync::OnceCell;
-use sqlx_core::connection::Connection;
-use sqlx_core::query_builder::QueryBuilder;
-use sqlx_core::query_scalar::query_scalar;
-use std::fmt::Write;
 
 use crate::error::Error;
 use crate::executor::Executor;
 use crate::pool::{Pool, PoolOptions};
 use crate::query::query;
 use crate::{MySql, MySqlConnectOptions, MySqlConnection};
-
 pub(crate) use sqlx_core::testing::*;
 
 // Using a blocking `OnceCell` here because the critical sections are short.
 static MASTER_POOL: OnceCell<Pool<MySql>> = OnceCell::new();
+// Automatically delete any databases created before the start of the test binary.
 
 impl TestSupport for MySql {
     fn test_context(args: &TestArgs) -> BoxFuture<'_, Result<TestContext<Self>, Error>> {
         Box::pin(async move { test_context(args).await })
     }
 
-    fn cleanup_test(db_name: &str) -> BoxFuture<'_, Result<(), Error>> {
+    fn cleanup_test(args: &TestArgs) -> BoxFuture<'_, Result<(), Error>> {
+        let db_name = Self::db_name(args);
+
         Box::pin(async move {
             let mut conn = MASTER_POOL
                 .get()
@@ -34,7 +32,7 @@ impl TestSupport for MySql {
                 .acquire()
                 .await?;
 
-            do_cleanup(&mut conn, db_name).await
+            do_cleanup(&mut conn, &db_name).await
         })
     }
 
@@ -44,49 +42,72 @@ impl TestSupport for MySql {
 
             let mut conn = MySqlConnection::connect(&url).await?;
 
-            let delete_db_ids: Vec<u64> = query_scalar("select db_id from _sqlx_test_databases")
-                .fetch_all(&mut conn)
-                .await?;
+            let delete_db_names: Vec<String> = query_scalar(indoc::indoc!(
+                r#"
+                SELECT db_name AS "db_name: _"
+                FROM _sqlx_test.databases
+                "#
+            ))
+            .fetch_all(&mut conn)
+            .await?;
 
-            if delete_db_ids.is_empty() {
+            if delete_db_names.is_empty() {
                 return Ok(None);
             }
 
-            let mut deleted_db_ids = Vec::with_capacity(delete_db_ids.len());
+            let mut deleted_db_names = Vec::with_capacity(delete_db_names.len());
 
-            let mut command = String::new();
-
-            for db_id in &delete_db_ids {
-                command.clear();
-
-                let db_name = format!("_sqlx_test_database_{db_id}");
-
-                writeln!(command, "drop database if exists {db_name}").ok();
-                match conn.execute(&*command).await {
+            for db_name in delete_db_names {
+                match conn
+                    .execute(format!("DROP DATABASE IF EXISTS {db_name};").as_str())
+                    .await
+                {
                     Ok(_deleted) => {
-                        deleted_db_ids.push(db_id);
+                        deleted_db_names.push(db_name);
                     }
                     // Assume a database error just means the DB is still in use.
                     Err(Error::Database(dbe)) => {
-                        eprintln!("could not clean test database {db_id:?}: {dbe}")
+                        eprintln!("could not clean test database {db_name:?}: {dbe}")
                     }
                     // Bubble up other errors
                     Err(e) => return Err(e),
                 }
             }
 
-            let mut query = QueryBuilder::new("delete from _sqlx_test_databases where db_id in (");
+            let placeholders_str = if !deleted_db_names.is_empty() {
+                deleted_db_names
+                    .iter()
+                    .map(|_| "?")
+                    .fold(String::new(), |mut acc, placeholder| {
+                        if !acc.is_empty() {
+                            acc.push(',');
+                        }
+                        acc.push_str(placeholder);
+                        acc
+                    })
+            } else {
+                // MySQL does not consider the "in ()" syntax correct, so we add NULL
+                "NULL".to_string()
+            };
 
-            let mut separated = query.separated(",");
+            let query_str = indoc::formatdoc!(
+                r#"
+                DELETE
+                FROM _sqlx_test.databases
+                WHERE db_name in ({placeholders_str});
+                "#
+            );
+            let mut query = query(query_str.as_str());
+            let deleted_db_names_count = deleted_db_names.len();
 
-            for db_id in &deleted_db_ids {
-                separated.push_bind(db_id);
+            for deleted_db_name in deleted_db_names {
+                query = query.bind(deleted_db_name);
             }
 
-            query.push(")").build().execute(&mut conn).await?;
+            query.execute(&mut conn).await?;
 
             let _ = conn.close().await;
-            Ok(Some(delete_db_ids.len()))
+            Ok(Some(deleted_db_names_count))
         })
     }
 
@@ -136,30 +157,36 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<MySql>, Error> {
     let mut conn = master_pool.acquire().await?;
 
     // language=MySQL
-    conn.execute(
+    conn.execute(indoc::indoc!(
         r#"
-        create table if not exists _sqlx_test_databases (
-            db_name text primary key,
-            test_path text not null,
-            created_at timestamp not null default current_timestamp
+        CREATE SCHEMA IF NOT EXISTS _sqlx_test;
+
+        CREATE TABLE IF NOT EXISTS _sqlx_test.databases
+        (
+            db_name    VARCHAR(63) PRIMARY KEY,
+            test_path  VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-    "#,
-    )
+        "#
+    ))
     .await?;
 
     let db_name = MySql::db_name(args);
     do_cleanup(&mut conn, &db_name).await?;
 
-    query("insert into _sqlx_test_databases(db_name, test_path) values (?, ?)")
-        .bind(&db_name)
-        .bind(args.test_path)
-        .execute(&mut *conn)
-        .await?;
+    query(indoc::indoc!(
+        r#"
+        INSERT INTO _sqlx_test.databases(db_name, test_path)
+        VALUES (?, ?);
+        "#
+    ))
+    .bind(&db_name)
+    .bind(args.test_path)
+    .execute(&mut *conn)
+    .await?;
 
-    conn.execute(&format!("create database {db_name:?}")[..])
+    conn.execute(format!("CREATE DATABASE {db_name};").as_str())
         .await?;
-
-    eprintln!("created database {db_name}");
 
     Ok(TestContext {
         pool_opts: PoolOptions::new()
@@ -180,12 +207,19 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<MySql>, Error> {
 }
 
 async fn do_cleanup(conn: &mut MySqlConnection, db_name: &str) -> Result<(), Error> {
-    let delete_db_command = format!("drop database if exists {db_name:?};");
-    conn.execute(&*delete_db_command).await?;
-    query("delete from _sqlx_test.databases where db_name = $1::text")
-        .bind(db_name)
-        .execute(&mut *conn)
+    conn.execute(format!("DROP DATABASE IF EXISTS {db_name};").as_str())
         .await?;
+
+    query(indoc::indoc!(
+        r#"
+        DELETE
+        FROM _sqlx_test.databases
+        WHERE db_name = ?
+        "#
+    ))
+    .bind(db_name)
+    .execute(&mut *conn)
+    .await?;
 
     Ok(())
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures_core::future::BoxFuture;
 
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 pub use fixtures::FixtureSnapshot;
 use sha2::{Digest, Sha512};
 
@@ -28,7 +28,7 @@ pub trait TestSupport: Database {
     /// The user credentials it contains must have the privilege to create and drop databases.
     fn test_context(args: &TestArgs) -> BoxFuture<'_, Result<TestContext<Self>, Error>>;
 
-    fn cleanup_test(db_name: &str) -> BoxFuture<'_, Result<(), Error>>;
+    fn cleanup_test(args: &TestArgs) -> BoxFuture<'_, Result<(), Error>>;
 
     /// Cleanup any test databases that are no longer in-use.
     ///
@@ -49,8 +49,9 @@ pub trait TestSupport: Database {
         let mut hasher = Sha512::new();
         hasher.update(args.test_path.as_bytes());
         let hash = hasher.finalize();
-        let hash = URL_SAFE.encode(&hash[..39]);
-        let db_name = format!("_sqlx_test_{}", hash);
+        let hash = URL_SAFE_NO_PAD.encode(&hash[..39]);
+        let db_name = format!("_sqlx_test_{}", hash).replace("-", "_");
+
         debug_assert!(db_name.len() == 63);
         db_name
     }
@@ -230,11 +231,8 @@ where
         let res = test_fn(test_context.pool_opts, test_context.connect_opts).await;
 
         if res.is_success() {
-            if let Err(e) = DB::cleanup_test(&DB::db_name(&args)).await {
-                eprintln!(
-                    "failed to delete database {:?}: {}",
-                    test_context.db_name, e
-                );
+            if let Err(e) = DB::cleanup_test(&args).await {
+                eprintln!("failed to delete database {:?}: {e}", test_context.db_name,);
             }
         }
 
