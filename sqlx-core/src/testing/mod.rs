@@ -28,7 +28,7 @@ pub trait TestSupport: Database {
     /// The user credentials it contains must have the privilege to create and drop databases.
     fn test_context(args: &TestArgs) -> BoxFuture<'_, Result<TestContext<Self>, Error>>;
 
-    fn cleanup_test(db_name: &str) -> BoxFuture<'_, Result<(), Error>>;
+    fn cleanup_test(args: &TestArgs) -> BoxFuture<'_, Result<(), Error>>;
 
     /// Cleanup any test databases that are no longer in-use.
     ///
@@ -231,11 +231,8 @@ where
         let res = test_fn(test_context.pool_opts, test_context.connect_opts).await;
 
         if res.is_success() {
-            if let Err(e) = DB::cleanup_test(&DB::db_name(&args)).await {
-                eprintln!(
-                    "failed to delete database {:?}: {}",
-                    test_context.db_name, e
-                );
+            if let Err(e) = DB::cleanup_test(&args).await {
+                eprintln!("failed to delete database {:?}: {e}", test_context.db_name,);
             }
         }
 

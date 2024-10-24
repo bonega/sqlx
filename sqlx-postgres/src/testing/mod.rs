@@ -26,7 +26,9 @@ impl TestSupport for Postgres {
         Box::pin(async move { test_context(args).await })
     }
 
-    fn cleanup_test(db_name: &str) -> BoxFuture<'_, Result<(), Error>> {
+    fn cleanup_test(args: &TestArgs) -> BoxFuture<'_, Result<(), Error>> {
+        let db_name = Self::db_name(args);
+
         Box::pin(async move {
             let mut conn = MASTER_POOL
                 .get()
@@ -34,7 +36,7 @@ impl TestSupport for Postgres {
                 .acquire()
                 .await?;
 
-            do_cleanup(&mut conn, db_name).await
+            do_cleanup(&mut conn, &db_name).await
         })
     }
 
