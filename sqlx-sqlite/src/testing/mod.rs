@@ -14,8 +14,10 @@ impl TestSupport for Sqlite {
         Box::pin(async move { test_context(args).await })
     }
 
-    fn cleanup_test(db_name: &str) -> BoxFuture<'_, Result<(), Error>> {
-        Box::pin(async move { Ok(crate::fs::remove_file(db_name).await?) })
+    fn cleanup_test(args: &TestArgs) -> BoxFuture<'_, Result<(), Error>> {
+        let db_path = convert_path(args.test_path);
+
+        Box::pin(async move { Ok(crate::fs::remove_file(db_path).await?) })
     }
 
     fn cleanup_test_dbs() -> BoxFuture<'static, Result<Option<usize>, Error>> {
